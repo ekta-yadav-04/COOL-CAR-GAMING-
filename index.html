@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Mini Car Drive — HTML/CSS/JS</title>
+<style>
+  /* Basic layout */
+  :root { --bg:#0b1220; --panel:#11151b; --accent:#ffcc00; }
+  html,body { height:100%; margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial; background:linear-gradient(#07101a,#07111a 60%); color:#eee; display:flex; align-items:center; justify-content:center; }
+  .wrap { width:100%; max-width:520px; margin:20px; }
+  header { text-align:center; margin-bottom:8px; }
+  canvas { display:block; width:100%; background:linear-gradient(#3a3a3a,#2a2a2a); border-radius:12px; box-shadow:0 8px 30px rgba(0,0,0,0.6); }
+  .hud { margin-top:8px; display:flex; justify-content:space-between; gap:8px; }
+  .panel { background:var(--panel); padding:8px 10px; border-radius:8px; min-width:0; display:flex; gap:8px; align-items:center; justify-content:center; font-size:14px; }
+  button { background:transparent; border:1px solid rgba(255,255,255,0.08); color:inherit; padding:6px 10px; border-radius:8px; cursor:pointer; }
+  .controls { margin-top:10px; display:flex; gap:8px; justify-content:center; }
+  .touch-btn { padding:12px 18px; border-radius:8px; background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.06); user-select:none; }
+  .center { text-align:center; }
+  .overlay { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; pointer-events:none; }
+  .menu { background:rgba(2,6,10,0.85); padding:18px; border-radius:12px; text-align:center; pointer-events:auto; width:90%; max-width:380px; }
+  .menu h1 { margin:0 0 8px 0; font-size:20px; }
+  .small { font-size:13px; color:#ddd; opacity:0.95; margin-top:6px; }
+  .footer { margin-top:10px; font-size:12px; color:#bbb; text-align:center; }
+  @media (max-width:520px){
+    .hud { flex-direction:column; align-items:stretch; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h2>Mini Car Drive</h2>
+    <div class="small">Use ← → keys or touch buttons. Avoid traffic. Score increases with distance.</div>
+  </header>
+
+  <!-- Game canvas -->
+  <div style="position:relative;">
+    <canvas id="game" width="360" height="640"></canvas>
+
+    <!-- overlays (start / game over) -->
+    <div id="overlay" class="overlay" style="display:flex;">
+      <div id="menu" class="menu">
+        <h1>Mini Car Drive</h1>
+        <p class="small">Arrow keys / A D to steer. Up to accelerate. Tap to play on mobile.</p>
+        <div style="margin-top:12px;">
+          <button id="startBtn">Play</button>
+        </div>
+        <div class="footer">High score saved locally</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- HUD -->
+  <div class="hud">
+    <div class="panel">Score: <span id="score">0</span></div>
+    <div class="panel">High: <span id="high">0</span></div>
+    <div class="panel">Speed: <span id="speed">0</span> km/h</div>
+    <div style="min-width:86px; display:flex; align-items:center; gap:6px;">
+      <button id="pauseBtn">Pause</button>
+      <button id="resetBtn">Restart</button>
+    </div>
+  </div>
+
+  <!-- Mobile controls -->
+  <div class="controls" id="touchControls" style="display:none;">
+    <div class="touch-btn" id="leftBtn">◀</div>
+    <div class="touch-btn" id="accelBtn">▲</div>
+    <div class="touch-btn" id="rightBtn">▶</div>
+  </div>
+</div>
+
+<script>
+/* ====== Simple car driving game (canvas) ======
+   - Top-down road with lanes, player car, obstacles
+   - Arrow keys and touch controls
+   - Score, speed, difficulty scaling, localStorage highscore
+*/
+
+/* --------- Config --------- */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W = canvas.width, H = canvas.height;
+
+const cfg = {
+  roadWidth: W * 0.7,
+  laneCount: 3,
+  carWidth: 34,
+  carHeight: 58,
+  maxSpeed: 700,            // pixels per second (game units)
+  accel: 900,               // px/s^2
+  brake: 1400,
+  friction: 800,
+  obstacleMinGap: 1400,     // ms minimal time between obstacles (scaled)
+};
+
+/* --------- Game state --------- */
+let state = {
+  running: false,
+  paused: false,
+  lastTime: 0,
+  speed: 0,        // px/s
+  score: 0,
+  high: 0,
+  spawnTimer: 0,
+  difficultyTime: 0,
+};
+
+/* --------- Player car --------- */
+const player = {
+  lane: 1, // 0..laneCount-1
+  x: 0,
+  y: H - 110,
+  width: cfg.carWidth,
+  height: cfg.carHeight,
+  color: '#ffcc00',
+};
+
+/* --------- Obstacles --------- */
+const obstacles = [];
+
+/* --------- UI elements --------- */
+const overlay = document.getElementById('overlay');
+const menu = document.getElementById('menu');
+const startBtn = document.getElementById('startBtn');
+const pauseBtn = document.getElementById('pauseBtn');
+const resetBtn = document.getElementById('resetBtn');
+const scoreEl = document.getElementById('score');
+const highEl = document.getElementById('high');
+const speedEl = document.getElementById('speed');
+const touchControls = document.getElementById('touchControls');
+const leftBtn = document.getElementById('leftBtn');
+const rightBtn = document.getElementById('rightBtn');
+const accelBtn = document.getElementById('accelBtn');
+
+/* --------- Initialization --------- */
+function loadHigh(){ state.high = Number(localStorage.getItem('mini_car_high') || 0); highEl.textContent = state.high; }
+loadHigh();
+
+function resizeCanvas(){
+  // keep canvas internal size constant for predictable physics; scale via CSS handled automatically
+  // (If you want to be fully responsive, you can rescale canvas.width/height here)
+}
+window.addEventListener('resize', resizeCanvas);
+
+/* --------- Helpers --------- */
+function laneX(l){
+  const roadLeft = (W - cfg.roadWidth)/2;
+  const laneW = cfg.roadWidth / cfg.laneCount;
+  return roadLeft + laneW * (l + 0.5);
+}
+
+/* --------- Controls --------- */
+const keys = {};
+window.addEventListener('keydown', e=>{
+  keys[e.key.toLowerCase()] = true;
+  if(!state.running && (e.key === 'Enter' || e.key === ' ')) startGame();
+});
+window.addEventListener('keyup', e=>{ keys[e.key.toLowerCase()] = false; });
+
+/* Touch: show mobile controls if touch-capable */
+if(('ontouchstart' in window) || navigator.maxTouchPoints>0){
+  touchControls.style.display = 'flex';
+  leftBtn.addEventListener('touchstart', e=>{ e.preventDefault(); keys['arrowleft']=true; });
+  leftBtn.addEventListener('touchend', e=>{ e.preventDefault(); keys['arrowleft']=false; });
+
+  rightBtn.addEventListener('touchstart', e=>{ e.preventDefault(); keys['arrowright']=true; });
+  rightBtn.addEventListener('touchend', e=>{ e.preventDefault(); keys['arrowright']=false; });
+
+  accelBtn.addEventListener('touchstart', e=>{ e.preventDefault(); keys['arrowup']=true; });
+  accelBtn.addEventListener('touchend', e=>{ e.preventDefault(); keys['arrowup']=false; });
+}
+
+/* --------- Game flow --------- */
+startBtn.addEventListener('click', startGame);
+pauseBtn.addEventListener('click', ()=>{ state.paused = !state.paused; pauseBtn.textContent = state.paused ? 'Resume' : 'Pause'; });
+resetBtn.addEventListener('click', resetGame);
+
+function startGame(){
+  overlay.style.display = 'none';
+  state.running = true;
+  state.paused = false;
+  state.lastTime = performance.now();
+  state.score = 0;
+  state.speed = 0;
+  state.spawnTimer = 0;
+  state.difficultyTime = 0;
+  obstacles.length = 0;
+  player.lane = Math.floor(cfg.laneCount/2);
+  player.x = laneX(player.lane);
+  loop(state.lastTime);
+}
+
+function endGame(){
+  state.running = false;
+  overlay.style.display = 'flex';
+  menu.innerHTML = `<h1>Game Over</h1>
+    <p class="small">Score: ${Math.floor(state.score)}</p>
+    <div style="margin-top:12px;"><button id="playAgain">Play again</button></div>
+    <div class="footer">High score: ${state.high}</div>`;
+  document.getElementById('playAgain').addEventListener('click', startGame);
+  // save highscore
+  if(Math.floor(state.score) > state.high){
+    state.high = Math.floor(state.score);
+    localStorage.setItem('mini_car_high', state.high);
+    highEl.textContent = state.high;
+  }
+}
+
+function resetGame(){
+  state.running = false;
+  overlay.style.display = 'flex';
+  menu.innerHTML = `<h1>Mini Car Drive</h1>
+    <p class="small">Arrow keys / A D to steer. Up to accelerate. Tap to play on mobile.</p>
+    <div style="margin-top:12px;"><button id="startBtn2">Play</button></div>
+    <div class="footer">High score saved locally</div>`;
+  document.getElementById('startBtn2').addEventListener('click', startGame);
+}
+
+/* --------- Obstacles management --------- */
+function spawnObstacle(){
+  // Choose random lane and width
+  const lane = Math.floor(Math.random()*cfg.laneCount);
+  const w = cfg.carWidth + (Math.random()*12 - 6);
+  obstacles.push({
+    lane,
+    x: laneX(lane),
+    y: -80,
+    width: w,
+    height: cfg.carHeight,
+    speedBonus: 0, // allows different obstacle speeds if wanted
+    color: '#d9534f'
+  });
+}
+
+/* --------- Collision detection (AABB) --------- */
+function collides(a, b){
+  return Math.abs(a.x - b.x) < (a.width/2 + b.width/2) &&
+         Math.abs(a.y - b.y) < (a.height/2 + b.height/2);
+}
+
+/* --------- Main loop --------- */
+function loop(now){
+  if(!state.running) return;
+  let dt = (now - state.lastTime) / 1000; // seconds
+  state.lastTime = now;
+  if(state.paused){ requestAnimationFrame(loop); return; }
+
+  // update difficulty (makes spawn faster and obstacles faster)
+  state.difficultyTime += dt;
+  const difficulty = 1 + Math.min(3, state.difficultyTime / 20);
+
+  // input: steering
+  const steerLeft = keys['arrowleft'] || keys['a'];
+  const steerRight = keys['arrowright'] || keys['d'];
+  const accel = keys['arrowup'] || keys['w'];
+  const brake = keys['arrowdown'] || keys['s'];
+
+  // speed physics
+  if(accel) state.speed += cfg.accel * dt;
+  else if(brake) state.speed -= cfg.brake * dt;
+  else {
+    // friction
+    if(state.speed > 0) state.speed -= cfg.friction * dt;
+    if(state.speed < 0) state.speed = 0;
+  }
+  state.speed = Math.max(0, Math.min(cfg.maxSpeed * difficulty, state.speed));
+
+  // lane switching (instant lane change for simplicity; can be animated)
+  if(steerLeft && player.lane > 0){ player.lane -= 1; keys['arrowleft'] = false; keys['a'] = false; }
+  if(steerRight && player.lane < cfg.laneCount-1){ player.lane += 1; keys['arrowright'] = false; keys['d'] = false; }
+  // smooth position toward lane center
+  const targetX = laneX(player.lane);
+  player.x += (targetX - player.x) * Math.min(10*dt, 1);
+
+  // spawn obstacles based on spawnTimer and difficulty
+  state.spawnTimer += dt * 1000;
+  const spawnInterval = Math.max(500, cfg.obstacleMinGap / difficulty); // ms
+  if(state.spawnTimer > spawnInterval){
+    spawnObstacle();
+    state.spawnTimer = 0;
+  }
+
+  // update obstacles
+  for(let i=obstacles.length-1; i>=0; i--){
+    const ob = obstacles[i];
+    ob.y += (state.speed * 0.9 + 180 * difficulty + ob.speedBonus) * dt;
+    // collision check — make simple rectangles centered at x,y
+    const playerBox = { x: player.x, y: player.y, width: player.width, height: player.height };
+    const obBox = { x: ob.x, y: ob.y, width: ob.width, height: ob.height };
+    if(collides(playerBox, obBox)){
+      endGame();
+      return;
+    }
+    // remove off-screen obstacles
+    if(ob.y - ob.height > H + 100) obstacles.splice(i,1);
+  }
+
+  // scoring increases with forward distance (speed)
+  state.score += state.speed * dt * 0.02;
+  scoreEl.textContent = Math.floor(state.score);
+  speedEl.textContent = Math.floor(state.speed*0.06); // scaled to "km/h" feel
+
+  // render
+  drawScene();
+
+  requestAnimationFrame(loop);
+}
+
+/* --------- Draw scene --------- */
+function drawScene(){
+  // clear
+  ctx.clearRect(0,0,W,H);
+
+  // draw road
+  const roadLeft = (W - cfg.roadWidth)/2;
+  const roadRight = roadLeft + cfg.roadWidth;
+  ctx.fillStyle = '#2b2b2b';
+  roundRectFill(ctx, roadLeft, 0, cfg.roadWidth, H, 16);
+
+  // lane lines
+  const laneW = cfg.roadWidth / cfg.laneCount;
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  ctx.lineWidth = 2;
+  for(let i=1;i<cfg.laneCount;i++){
+    const x = roadLeft + laneW * i;
+    drawDashedLine(ctx, x, 0, x, H, 18, 28);
+  }
+
+  // roadside
+  ctx.fillStyle = '#163222';
+  ctx.fillRect(0,0,roadLeft, H);
+  ctx.fillRect(roadRight, 0, W-roadRight, H);
+
+  // obstacles (draw as rectangles)
+  for(const ob of obstacles){
+    ctx.save();
+    ctx.translate(ob.x, ob.y);
+    ctx.fillStyle = ob.color;
+    roundRectFill(ctx, -ob.width/2, -ob.height/2, ob.width, ob.height, 6);
+    ctx.restore();
+  }
+
+  // draw player car (triangle + rectangle)
+  ctx.save();
+  ctx.translate(player.x, player.y);
+  // shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  roundRectFill(ctx, -player.width/2+2, -player.height/2+8, player.width, player.height/3, 6);
+  // car body
+  ctx.fillStyle = player.color;
+  roundRectFill(ctx, -player.width/2, -player.height/2, player.width, player.height, 6);
+  // windshield
+  ctx.fillStyle = 'rgba(0,0,0,0.28)';
+  roundRectFill(ctx, -player.width/4, -player.height/2+8, player.width/2, player.height/3, 3);
+  ctx.restore();
+}
+
+/* small helpers for drawing */
+function roundRectFill(ctx, x, y, w, h, r){
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y, x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x, y+h, r);
+  ctx.arcTo(x, y+h, x, y, r);
+  ctx.arcTo(x, y, x+w, y, r);
+  ctx.closePath();
+  ctx.fill();
+}
+function drawDashedLine(ctx, x1,y1,x2,y2, dash, gap){
+  ctx.beginPath();
+  ctx.setLineDash([dash, gap]);
+  ctx.moveTo(x1,y1);
+  ctx.lineTo(x2,y2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+/* --------- Kick things off: draw initial frame and attach keyboard hints ----- */
+(function init(){
+  player.x = laneX(player.lane);
+  drawScene();
+})();
+</script>
+</body>
+</html>
